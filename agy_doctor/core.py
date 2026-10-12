@@ -86,7 +86,7 @@ def scan_sessions() -> List[Dict]:
                         has_active_error = True
                     
                 bloat_rows = c_conn.execute(
-                    "SELECT length(step_payload) FROM steps WHERE idx > ? AND step_type = 132 AND length(step_payload) > 2000",
+                    "SELECT length(step_payload) FROM steps WHERE idx > ? AND step_type IN (15, 132) AND length(step_payload) > 2000",
                     (last_checkpoint_idx,)
                 ).fetchall()
                 bloat_bytes = sum(r[0] for r in bloat_rows)
@@ -103,7 +103,7 @@ def scan_sessions() -> List[Dict]:
                     reasons.append("Unresolved connection interrupted / retry error at tail")
                 if meta["status"] == "CASCADE_RUN_STATUS_RUNNING":
                     reasons.append("Stuck in RUNNING status lock")
-            elif bloat_bytes > 400 * 1024 or size_mb > 25:
+            elif bloat_bytes > 300 * 1024 or size_mb > 25:
                 health = "WARNING"
                 reasons.append(f"Unpruned tool payloads ({bloat_bytes / 1024:.0f} KB) risk gateway timeout")
                 
@@ -136,7 +136,11 @@ def find_last_valid_step_idx(cur) -> int:
         return 0
 
     has_error_in_tail = any(stype == 17 for idx, stype in rows[:30])
-    if not has_error_in_tail:
+    
+    # Check if the tail is an unfinished step 15 without a following tool
+    is_dangling_tail_thought = (rows[0][1] == 15 and len(rows) > 1 and rows[1][1] not in (132, 101, 8))
+
+    if not has_error_in_tail and not is_dangling_tail_thought:
         return rows[0][0]
 
     for idx, stype in rows:
@@ -155,7 +159,7 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
     2. Rewinds trailing aborted error cascades back to the last valid completed step.
     3. Cleans aborted thoughts (15 immediately preceding 17) and orphaned errors (17).
     4. Cleans legacy plugin ephemeral noise steps (90).
-    5. Prunes bloated tool outputs since the last checkpoint.
+    5. Performs deep triple-pruning on bloated tool payloads and oversized proposals (Field 140, Field 5, Field 20).
     6. Resets conversation summary status to IDLE.
     7. Validates integrity and vacuums the database.
     """
@@ -189,7 +193,6 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
     cleaned_error_steps = 0
     cleaned_noise_steps = 0
     if not dry_run:
-        # Delete aborted thoughts that were followed by errors
         cur.execute("""
             DELETE FROM steps 
             WHERE step_type = 15 AND idx IN (
@@ -200,28 +203,29 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
         """)
         cleaned_aborted_thoughts = cur.rowcount
 
-        # Delete all error steps
         cur.execute("DELETE FROM steps WHERE step_type = 17")
         cleaned_error_steps = cur.rowcount
 
-        # Delete agydoc plugin notification noise
         cur.execute("DELETE FROM steps WHERE step_type = 90 AND step_payload LIKE ?", (b"%agydoc-plugin%",))
         cleaned_noise_steps = cur.rowcount
 
     new_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0 if not dry_run else last_valid_idx
     
-    # 3. In-place prune bloated tool payloads
+    # 3. In-place deep prune bloated tool payloads and proposals
     last_checkpoint_idx = session_info.get("last_checkpoint", 0)
-    rows = cur.execute("SELECT idx, step_payload FROM steps WHERE idx > ? AND idx <= ?", (last_checkpoint_idx, new_max)).fetchall()
+    rows = cur.execute(
+        "SELECT idx, step_payload FROM steps WHERE idx > ? AND idx <= ? AND step_type IN (15, 132)",
+        (last_checkpoint_idx, new_max)
+    ).fetchall()
     
     pruned_steps_count = 0
     saved_bytes = 0
     
     for idx, payload in rows:
-        if not payload:
+        if not payload or len(payload) < 1500:
             continue
         orig_len = len(payload)
-        optimized = prune_tool_payload(payload, max_output_chars=500)
+        optimized = prune_tool_payload(payload, max_output_chars=400)
         if len(optimized) < orig_len:
             if not dry_run:
                 cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (optimized, idx))

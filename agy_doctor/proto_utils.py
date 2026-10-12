@@ -1,5 +1,10 @@
 """
-Protobuf wire-format parser and re-encoder without external dependencies.
+Protobuf wire-format parser and deep re-encoder without external dependencies.
+Safely prunes oversized historical tool payloads and redundant CodeContent across:
+  - Step 132 Field 140 (Tool input args & tool output bodies)
+  - Step 132 Field 5 (Tool call execution records)
+  - Step 15 Field 20 (Historical tool call proposals with massive embedded code)
+Preserves 100% of user prompts, assistant thoughts, tool metadata, and file paths.
 """
 
 def decode_fields(b: bytes):
@@ -57,7 +62,6 @@ def decode_fields(b: bytes):
                 i += length
                 fields.append((fnum, wtype, data))
             else:
-                # Unsupported wire types (1: 64-bit, 5: 32-bit), stop safe parsing
                 break
         except Exception:
             break
@@ -86,40 +90,109 @@ def encode_field(fnum: int, wtype: int, val) -> bytes:
     return bytes(res)
 
 
+def truncate_text_slice(b: bytes, max_head: int = 300, max_tail: int = 100, marker_tag: str = "CodeContent") -> bytes:
+    """Truncates a byte slice keeping head and tail."""
+    if len(b) <= max_head + max_tail + 50:
+        return b
+    head = b[:max_head]
+    tail = b[-max_tail:]
+    marker = f"\n... [{marker_tag} truncated by agydoc to preserve tokens] ...\n".encode("utf-8")
+    return head + marker + tail
+
+
 def prune_tool_payload(payload: bytes, max_output_chars: int = 500) -> bytes:
     """
-    Inspects a step payload. If it is a tool execution result (step_type 132 / Field 140),
-    safely truncates the raw output body (Subfield 2) while keeping all metadata,
-    file paths, and line numbers 100% intact.
+    Performs deep pruning on a step payload:
+    1. For Step 132 (Tool execution result):
+       - Field 140 Subfield 2 (Tool output response) -> truncate if > max_output_chars
+       - Field 140 Subfield 1 (Tool arguments / CodeContent) -> truncate if > 1000 bytes
+       - Field 5 Subfield 4 (Execution call record JSON) -> truncate if > 1000 bytes
+    2. For Step 15 (Planner response):
+       - Field 20 Subfield 7 (Proposed tool call JSON) -> truncate if > 1500 bytes
     """
     fields = decode_fields(payload)
-    has_large_f140 = False
-    new_f140_bytes = None
-    
+    if not fields:
+        return payload
+
+    stype_val = None
     for fnum, wtype, val in fields:
-        if fnum == 140 and wtype == 2 and len(val) > 1000:
-            subfields = decode_fields(val)
-            new_subfields = bytearray()
-            for sf_num, sf_wtype, sf_val in subfields:
-                if sf_num == 2 and sf_wtype == 2 and len(sf_val) > max_output_chars:
-                    has_large_f140 = True
-                    # Truncate content: head + marker + tail
-                    head = sf_val[:max_output_chars]
-                    tail = sf_val[-150:]
-                    marker = b"\n... [Output pruned by antigravity-doctor for context optimization] ...\n"
-                    truncated = head + marker + tail
-                    new_subfields.extend(encode_field(sf_num, sf_wtype, truncated))
-                else:
-                    new_subfields.extend(encode_field(sf_num, sf_wtype, sf_val))
-            new_f140_bytes = bytes(new_subfields)
-            
-    if has_large_f140 and new_f140_bytes:
-        new_payload = bytearray()
+        if fnum == 1 and wtype == 0:
+            stype_val = val
+            break
+
+    modified = False
+    new_fields = bytearray()
+
+    # Case A: Tool Execution Step (step_type == 132)
+    if stype_val == 132:
         for fnum, wtype, val in fields:
-            if fnum == 140:
-                new_payload.extend(encode_field(fnum, wtype, new_f140_bytes))
+            # Field 5: tool call record
+            if fnum == 5 and wtype == 2 and len(val) > 1500:
+                sub = decode_fields(val)
+                new_sub = bytearray()
+                sub_mod = False
+                for sfnum, sfwtype, sfval in sub:
+                    if sfnum == 4 and sfwtype == 2 and len(sfval) > 1000:
+                        trun = truncate_text_slice(sfval, max_head=350, max_tail=100, marker_tag="Historical Tool Args")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    else:
+                        new_sub.extend(encode_field(sfnum, sfwtype, sfval))
+                if sub_mod:
+                    new_fields.extend(encode_field(fnum, wtype, bytes(new_sub)))
+                    modified = True
+                else:
+                    new_fields.extend(encode_field(fnum, wtype, val))
+
+            # Field 140: tool result and argument echo
+            elif fnum == 140 and wtype == 2 and len(val) > 1000:
+                sub = decode_fields(val)
+                new_sub = bytearray()
+                sub_mod = False
+                for sfnum, sfwtype, sfval in sub:
+                    # Subfield 1: args
+                    if sfnum == 1 and sfwtype == 2 and len(sfval) > 1000:
+                        trun = truncate_text_slice(sfval, max_head=250, max_tail=80, marker_tag="CodeContent Arg")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    # Subfield 2: output body
+                    elif sfnum == 2 and sfwtype == 2 and len(sfval) > max_output_chars:
+                        trun = truncate_text_slice(sfval, max_head=max_output_chars, max_tail=120, marker_tag="Tool Output")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    else:
+                        new_sub.extend(encode_field(sfnum, sfwtype, sfval))
+                if sub_mod:
+                    new_fields.extend(encode_field(fnum, wtype, bytes(new_sub)))
+                    modified = True
+                else:
+                    new_fields.extend(encode_field(fnum, wtype, val))
             else:
-                new_payload.extend(encode_field(fnum, wtype, val))
-        return bytes(new_payload)
-        
+                new_fields.extend(encode_field(fnum, wtype, val))
+
+    # Case B: Historical Planner Step (step_type == 15)
+    elif stype_val == 15:
+        for fnum, wtype, val in fields:
+            if fnum == 20 and wtype == 2 and len(val) > 2500:
+                sub = decode_fields(val)
+                new_sub = bytearray()
+                sub_mod = False
+                for sfnum, sfwtype, sfval in sub:
+                    # sf 7 is the tool proposal containing full CodeContent
+                    if sfnum == 7 and sfwtype == 2 and len(sfval) > 1500:
+                        trun = truncate_text_slice(sfval, max_head=350, max_tail=100, marker_tag="Proposed CodeContent")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    else:
+                        new_sub.extend(encode_field(sfnum, sfwtype, sfval))
+                if sub_mod:
+                    new_fields.extend(encode_field(fnum, wtype, bytes(new_sub)))
+                    modified = True
+                else:
+                    new_fields.extend(encode_field(fnum, wtype, val))
+            else:
+                new_fields.extend(encode_field(fnum, wtype, val))
+
+    if modified:
+        return bytes(new_fields)
     return payload

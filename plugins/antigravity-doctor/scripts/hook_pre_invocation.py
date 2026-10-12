@@ -3,7 +3,7 @@ Antigravity PreInvocation Hook for agydoc.
 Silently checks conversation database before LLM prefill:
 1. Automatically rewinds any trailing aborted retry loops (stream interrupted errors & broken thoughts)
    so the model never gets trapped repeatedly thinking about the same failed step.
-2. Silently prunes historical tool outputs in-place if they exceed safety thresholds to prevent gateway timeouts.
+2. Silently deep-prunes historical tool outputs and redundant argument echoes in-place to prevent gateway timeouts.
 3. NEVER injects dummy ephemeral messages into the conversation.
 """
 
@@ -87,33 +87,94 @@ def encode_field(fnum: int, wtype: int, val) -> bytes:
     return bytes(res)
 
 
-def prune_tool_payload(payload: bytes, max_output_chars: int = 500) -> bytes:
+def truncate_text_slice(b: bytes, max_head: int = 300, max_tail: int = 100, marker_tag: str = "CodeContent") -> bytes:
+    if len(b) <= max_head + max_tail + 50:
+        return b
+    head = b[:max_head]
+    tail = b[-max_tail:]
+    marker = f"\n... [{marker_tag} truncated by agydoc to preserve tokens] ...\n".encode("utf-8")
+    return head + marker + tail
+
+
+def prune_tool_payload(payload: bytes, max_output_chars: int = 400) -> bytes:
     fields = decode_fields(payload)
-    has_large_f140 = False
-    new_f140_bytes = None
+    if not fields:
+        return payload
+
+    stype_val = None
     for fnum, wtype, val in fields:
-        if fnum == 140 and wtype == 2 and len(val) > 1000:
-            subfields = decode_fields(val)
-            new_subfields = bytearray()
-            for sf_num, sf_wtype, sf_val in subfields:
-                if sf_num == 2 and sf_wtype == 2 and len(sf_val) > max_output_chars:
-                    has_large_f140 = True
-                    head = sf_val[:max_output_chars]
-                    tail = sf_val[-150:]
-                    marker = b"\n... [Output pruned by agydoc-plugin for context optimization] ...\n"
-                    truncated = head + marker + tail
-                    new_subfields.extend(encode_field(sf_num, sf_wtype, truncated))
-                else:
-                    new_subfields.extend(encode_field(sf_num, sf_wtype, sf_val))
-            new_f140_bytes = bytes(new_subfields)
-    if has_large_f140 and new_f140_bytes:
-        new_payload = bytearray()
+        if fnum == 1 and wtype == 0:
+            stype_val = val
+            break
+
+    modified = False
+    new_fields = bytearray()
+
+    if stype_val == 132:
         for fnum, wtype, val in fields:
-            if fnum == 140:
-                new_payload.extend(encode_field(fnum, wtype, new_f140_bytes))
+            if fnum == 5 and wtype == 2 and len(val) > 1500:
+                sub = decode_fields(val)
+                new_sub = bytearray()
+                sub_mod = False
+                for sfnum, sfwtype, sfval in sub:
+                    if sfnum == 4 and sfwtype == 2 and len(sfval) > 1000:
+                        trun = truncate_text_slice(sfval, max_head=350, max_tail=100, marker_tag="Historical Tool Args")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    else:
+                        new_sub.extend(encode_field(sfnum, sfwtype, sfval))
+                if sub_mod:
+                    new_fields.extend(encode_field(fnum, wtype, bytes(new_sub)))
+                    modified = True
+                else:
+                    new_fields.extend(encode_field(fnum, wtype, val))
+
+            elif fnum == 140 and wtype == 2 and len(val) > 1000:
+                sub = decode_fields(val)
+                new_sub = bytearray()
+                sub_mod = False
+                for sfnum, sfwtype, sfval in sub:
+                    if sfnum == 1 and sfwtype == 2 and len(sfval) > 1000:
+                        trun = truncate_text_slice(sfval, max_head=250, max_tail=80, marker_tag="CodeContent Arg")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    elif sfnum == 2 and sfwtype == 2 and len(sfval) > max_output_chars:
+                        trun = truncate_text_slice(sfval, max_head=max_output_chars, max_tail=120, marker_tag="Tool Output")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    else:
+                        new_sub.extend(encode_field(sfnum, sfwtype, sfval))
+                if sub_mod:
+                    new_fields.extend(encode_field(fnum, wtype, bytes(new_sub)))
+                    modified = True
+                else:
+                    new_fields.extend(encode_field(fnum, wtype, val))
             else:
-                new_payload.extend(encode_field(fnum, wtype, val))
-        return bytes(new_payload)
+                new_fields.extend(encode_field(fnum, wtype, val))
+
+    elif stype_val == 15:
+        for fnum, wtype, val in fields:
+            if fnum == 20 and wtype == 2 and len(val) > 2500:
+                sub = decode_fields(val)
+                new_sub = bytearray()
+                sub_mod = False
+                for sfnum, sfwtype, sfval in sub:
+                    if sfnum == 7 and sfwtype == 2 and len(sfval) > 1500:
+                        trun = truncate_text_slice(sfval, max_head=350, max_tail=100, marker_tag="Proposed CodeContent")
+                        new_sub.extend(encode_field(sfnum, sfwtype, trun))
+                        sub_mod = True
+                    else:
+                        new_sub.extend(encode_field(sfnum, sfwtype, sfval))
+                if sub_mod:
+                    new_fields.extend(encode_field(fnum, wtype, bytes(new_sub)))
+                    modified = True
+                else:
+                    new_fields.extend(encode_field(fnum, wtype, val))
+            else:
+                new_fields.extend(encode_field(fnum, wtype, val))
+
+    if modified:
+        return bytes(new_fields)
     return payload
 
 
@@ -122,7 +183,8 @@ def find_last_valid_step_idx(cur) -> int:
     if not rows:
         return 0
     has_error = any(stype == 17 for idx, stype in rows[:30])
-    if not has_error:
+    is_dangling = (rows[0][1] == 15 and len(rows) > 1 and rows[1][1] not in (132, 101, 8))
+    if not has_error and not is_dangling:
         return rows[0][0]
     for idx, stype in rows:
         if stype in (17, 90, 15):
@@ -172,33 +234,30 @@ def main():
         cur_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
         if cur_max > last_valid:
             cur.execute("DELETE FROM steps WHERE idx > ?", (last_valid,))
-            # Sync summary DB
             summ_db = gdir / "conversation_summaries.db"
             if summ_db.exists():
                 s_conn = sqlite3.connect(str(summ_db), timeout=2.0)
-                s_conn.execute("UPDATE conversation_summaries SET step_count = ? WHERE conversation_id = ?",
+                s_conn.execute("UPDATE conversation_summaries SET step_count = ?, status = 'CASCADE_RUN_STATUS_IDLE', not_fully_idle = 0 WHERE conversation_id = ?",
                                (last_valid + 1, convo_id))
                 s_conn.commit()
                 s_conn.close()
 
-        # 2. Prune historical tool output bloat
+        # 2. Prune historical tool output and proposal bloat
         r_ckp = cur.execute("SELECT MAX(idx) FROM steps WHERE step_type = 23").fetchone()
         last_ckp = r_ckp[0] if (r_ckp and r_ckp[0] is not None) else 0
 
         rows = cur.execute(
-            "SELECT idx, step_payload FROM steps WHERE idx > ? AND idx <= ? AND step_type = 132 AND length(step_payload) > 2000",
+            "SELECT idx, step_payload FROM steps WHERE idx > ? AND idx <= ? AND step_type IN (15, 132)",
             (last_ckp, last_valid)
         ).fetchall()
 
-        total_len = sum(len(r[1]) for r in rows if r[1])
-        if total_len > 150 * 1024 or len(rows) >= 8:
-            for idx, payload in rows:
-                if not payload:
-                    continue
-                orig_len = len(payload)
-                optimized = prune_tool_payload(payload, max_output_chars=500)
-                if len(optimized) < orig_len:
-                    cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (optimized, idx))
+        for idx, payload in rows:
+            if not payload or len(payload) < 1500:
+                continue
+            orig_len = len(payload)
+            optimized = prune_tool_payload(payload, max_output_chars=400)
+            if len(optimized) < orig_len:
+                cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (optimized, idx))
 
         conn.commit()
         conn.close()
