@@ -55,8 +55,8 @@ python agydoc.py heal <session-id>
 ### Option 2: Install as a global CLI
 
 ```bash
-git clone https://github.com/your-username/antigravity-doctor.git
-cd antigravity-doctor
+git clone https://github.com/aaronredzsir-star/when-your-antigravity-session-dies.git
+cd when-your-antigravity-session-dies
 pip install -e .
 
 # Now use `agydoc` anywhere!
