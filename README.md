@@ -1,47 +1,68 @@
 # 🩺 Antigravity Doctor (`agydoc`)
 
-> Fix bricked sessions and the 10-minute retry loop in Google Antigravity. Zero dependencies.
+> Quick, zero-dependency CLI to rescue bricked Google Antigravity sessions and fix the 10-minute retry loop.
 
----
+## Why?
 
-## The Problem
-
-When Antigravity sessions grow long, accumulated tool outputs (`view_file`, terminal dumps) bloat the local SQLite database. Once the server prompt cache expires, the next prefill takes >50s with zero keep-alive bytes streamed—triggering an API gateway timeout (`The stream was interrupted`).
-
-Because Antigravity's auto-compaction only runs after a *successful* turn, crashing mid-flight traps the session in a 10-minute retry hell with no manual way to recover.
-
-## What `agydoc` Does
-
-`agydoc` performs non-destructive, in-place protobuf surgery on your local database (`~/.gemini/antigravity`):
-
-* ✂️ **Prunes bloated tool dumps**: Truncates repetitive historical tool outputs while preserving 100% of user prompts, assistant thoughts, and diffs.
-* 🔓 **Unlocks deadlocks**: Clears dangling retry errors and resets sessions back to `IDLE`.
-* 🛡️ **Zero risk**: Automatically creates a timestamped `.bak` snapshot before any modification, with instant `restore`.
+Long sessions accumulate heavy tool outputs in local SQLite, triggering gateway timeouts and endless retry loops. `agydoc` safely prunes bloated historical tool outputs—unlocking the session while keeping 100% of your prompts, thoughts, and diffs intact.
 
 ---
 
 ## ⚡ Quickstart
 
-Requires Python 3.8+ (no external packages needed).
+Requires Python 3.8+ (no dependencies).
 
 ```bash
 git clone https://github.com/aaronredzsir-star/when-your-antigravity-session-dies.git
 cd when-your-antigravity-session-dies
-
-# 1. Scan session health
-python agydoc.py scan
-
-# 2. Heal bricked or bloated sessions
-python agydoc.py heal --all
-
-# 3. (Optional) Roll back if needed
-python agydoc.py restore <session-id>
 ```
 
-Or install as a global CLI:
+*(Optional: run `pip install -e .` to use the global `agydoc` command)*
+
+---
+
+## 🛠️ Usage & Examples
+
+### 1. Diagnose Sessions (`scan`)
+Find which conversations are deadlocked or bloated:
+
 ```bash
-pip install -e .
-agydoc heal --all
+python agydoc.py scan
+```
+```text
+ID (Short)   Status   Size     Steps  Health
+-----------  -------  -------  -----  -----------
+dd8201a0...  RUNNING  36.4 MB  2191   [!] BRICKED
+d01d9544...  IDLE     32.2 MB  882    [?] BLOATED
+b06a3eb7...  IDLE     1.2 MB   45     [✓] HEALTHY
+```
+
+### 2. Heal Bricked Sessions (`heal`)
+Prunes oversized tool outputs, removes trailing retry errors, and unlocks sessions back to `IDLE`:
+
+```bash
+# Heal all stuck or bloated sessions
+python agydoc.py heal --all
+
+# Or heal a specific session
+python agydoc.py heal dd8201a0
+```
+```text
+[+] Healing dd8201a0...
+    - Cleared hanging errors : 1
+    - Pruned tool outputs    : 38 steps (-728.5 KB)
+    - Safety backup saved    : dd8201a0.db.bak_20261012_1145
+    -> Recovered to IDLE state!
+```
+
+### 3. Rollback / Undo (`restore`)
+Every operation creates an automatic timestamped snapshot. Revert anytime:
+
+```bash
+python agydoc.py restore dd8201a0
+```
+```text
+[+] Restored dd8201a0 from backup dd8201a0.db.bak_20261012_1145
 ```
 
 ---
