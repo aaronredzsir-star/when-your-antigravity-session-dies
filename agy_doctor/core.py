@@ -78,9 +78,13 @@ def scan_sessions() -> List[Dict]:
                 if r_ckp and r_ckp[0] is not None:
                     last_checkpoint_idx = r_ckp[0]
                     
-                last_step = c_conn.execute("SELECT step_type FROM steps ORDER BY idx DESC LIMIT 1").fetchone()
-                if last_step and last_step[0] == 17:
-                    has_active_error = True
+                tail_rows = c_conn.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 10").fetchall()
+                if tail_rows:
+                    # Active error exists only if the tail itself ends in an error step or trailing cascade
+                    if tail_rows[0][1] == 17:
+                        has_active_error = True
+                    elif tail_rows[0][1] == 15 and any(r[1] == 17 for r in tail_rows[:5]):
+                        has_active_error = True
                     
                 bloat_rows = c_conn.execute(
                     "SELECT length(step_payload) FROM steps WHERE idx > ? AND step_type = 132 AND length(step_payload) > 2000",
@@ -97,7 +101,7 @@ def scan_sessions() -> List[Dict]:
             if meta["status"] == "CASCADE_RUN_STATUS_RUNNING" or has_active_error:
                 health = "BRICKED"
                 if has_active_error:
-                    reasons.append("Hanging in EOF / dropped connection error loop")
+                    reasons.append("Unresolved connection interrupted / retry error at tail")
                 if meta["status"] == "CASCADE_RUN_STATUS_RUNNING":
                     reasons.append("Stuck in RUNNING status lock")
             elif bloat_bytes > 400 * 1024 or size_mb > 25:
@@ -124,14 +128,38 @@ def scan_sessions() -> List[Dict]:
     return sessions
 
 
+def find_last_valid_step_idx(cur) -> int:
+    """
+    Finds the index of the last clean, valid step before any trailing broken error cascade.
+    """
+    rows = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 100").fetchall()
+    if not rows:
+        return 0
+
+    has_error_in_tail = any(stype == 17 for idx, stype in rows[:30])
+    if not has_error_in_tail:
+        # Tail doesn't have an error, return current max
+        return rows[0][0]
+
+    # Walk backwards past broken cascade steps until hitting a valid completed step
+    for idx, stype in rows:
+        if stype in (17, 90, 15):
+            continue
+        else:
+            return idx
+
+    return rows[-1][0]
+
+
 def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
     """
     Safely heals a bloated or bricked session:
     1. Creates timestamped safety backups of conversation DB and summaries DB.
-    2. Removes trailing hanging error steps.
-    3. Prunes bloated tool outputs since the last checkpoint.
-    4. Resets conversation summary status to IDLE.
-    5. Validates integrity and vacuums the database.
+    2. Rewinds trailing aborted error cascades back to the last valid completed step.
+    3. Cleans orphaned error steps (17) and plugin notification noise (90) to eliminate echo loops.
+    4. Prunes bloated tool outputs since the last checkpoint.
+    5. Resets conversation summary status to IDLE.
+    6. Validates integrity and vacuums the database.
     """
     conv_db = Path(session_info["db_path"])
     summ_db = Path(session_info["summ_db_path"])
@@ -142,33 +170,36 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
     
     if not dry_run:
         shutil.copy2(conv_db, conv_bak)
-        shutil.copy2(summ_db, summ_bak)
+        if summ_db.exists():
+            shutil.copy2(summ_db, summ_bak)
         
     conn = sqlite3.connect(conv_db)
     cur = conn.cursor()
     
-    # 1. Rollback trailing error steps (step_type == 17)
-    deleted_error_steps = 0
-    if not dry_run:
-        while True:
-            last = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 1").fetchone()
-            if not last or last[1] != 17:
-                break
-            cur.execute("DELETE FROM steps WHERE idx = ?", (last[0],))
-            deleted_error_steps += 1
-    else:
-        tail = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 50").fetchall()
-        for idx, stype in tail:
-            if stype == 17:
-                deleted_error_steps += 1
-            else:
-                break
-            
-    new_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
+    # 1. Rollback trailing error cascade
+    deleted_cascade_steps = 0
+    last_valid_idx = find_last_valid_step_idx(cur)
+    cur_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
     
-    # 2. In-place prune bloated tool payloads
+    if cur_max > last_valid_idx:
+        deleted_cascade_steps = cur_max - last_valid_idx
+        if not dry_run:
+            cur.execute("DELETE FROM steps WHERE idx > ?", (last_valid_idx,))
+            
+    # 2. Clean dead error steps (17) and ephemeral message noise (90 with agydoc-plugin)
+    cleaned_error_steps = 0
+    cleaned_noise_steps = 0
+    if not dry_run:
+        cur.execute("DELETE FROM steps WHERE step_type = 17")
+        cleaned_error_steps = cur.rowcount
+        cur.execute("DELETE FROM steps WHERE step_type = 90 AND step_payload LIKE ?", (b"%agydoc-plugin%",))
+        cleaned_noise_steps = cur.rowcount
+
+    new_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0 if not dry_run else last_valid_idx
+    
+    # 3. In-place prune bloated tool payloads
     last_checkpoint_idx = session_info.get("last_checkpoint", 0)
-    rows = cur.execute("SELECT idx, step_payload FROM steps WHERE idx > ?", (last_checkpoint_idx,)).fetchall()
+    rows = cur.execute("SELECT idx, step_payload FROM steps WHERE idx > ? AND idx <= ?", (last_checkpoint_idx, new_max)).fetchall()
     
     pruned_steps_count = 0
     saved_bytes = 0
@@ -193,8 +224,8 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
         
     conn.close()
     
-    # 3. Reset summary status to IDLE
-    if not dry_run:
+    # 4. Reset summary status to IDLE
+    if not dry_run and summ_db.exists():
         s_conn = sqlite3.connect(summ_db)
         s_conn.execute("""
             UPDATE conversation_summaries 
@@ -210,7 +241,8 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
         "id": session_info["id"],
         "title": session_info["title"],
         "backup_path": str(conv_bak) if not dry_run else "dry-run",
-        "deleted_error_steps": deleted_error_steps,
+        "deleted_error_steps": deleted_cascade_steps + cleaned_error_steps,
+        "cleaned_noise_steps": cleaned_noise_steps,
         "pruned_steps": pruned_steps_count,
         "saved_kb": saved_bytes / 1024,
         "new_max_step": new_max,

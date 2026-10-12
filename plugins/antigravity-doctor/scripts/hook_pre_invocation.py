@@ -1,8 +1,10 @@
 """
 Antigravity PreInvocation Hook for agydoc.
-Automatically checks conversation database before LLM prefill.
-If historical tool outputs exceed the bloat threshold, silently prunes them in-place
-to prevent gateway timeouts and 10-minute retry deadlocks.
+Silently checks conversation database before LLM prefill:
+1. Automatically rewinds any trailing aborted retry loops (stream interrupted errors & broken thoughts)
+   so the model never gets trapped repeatedly thinking about the same failed step.
+2. Silently prunes historical tool outputs in-place if they exceed safety thresholds to prevent gateway timeouts.
+3. NEVER injects dummy ephemeral messages into the conversation.
 """
 
 import sys
@@ -115,6 +117,21 @@ def prune_tool_payload(payload: bytes, max_output_chars: int = 500) -> bytes:
     return payload
 
 
+def find_last_valid_step_idx(cur) -> int:
+    rows = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 100").fetchall()
+    if not rows:
+        return 0
+    has_error = any(stype == 17 for idx, stype in rows[:30])
+    if not has_error:
+        return rows[0][0]
+    for idx, stype in rows:
+        if stype in (17, 90, 15):
+            continue
+        else:
+            return idx
+    return rows[-1][0]
+
+
 def main():
     try:
         raw = sys.stdin.read()
@@ -133,33 +150,46 @@ def main():
 
     home = Path.home()
     candidates = [
-        home / ".gemini" / "antigravity" / "conversations" / f"{convo_id}.db",
-        home / ".gemini" / "antigravity-ide" / "conversations" / f"{convo_id}.db",
+        (home / ".gemini" / "antigravity", home / ".gemini" / "antigravity" / "conversations" / f"{convo_id}.db"),
+        (home / ".gemini" / "antigravity-ide", home / ".gemini" / "antigravity-ide" / "conversations" / f"{convo_id}.db"),
     ]
-    db_file = None
-    for c in candidates:
-        if c.exists():
-            db_file = c
+    gdir, db_file = None, None
+    for gd, dbf in candidates:
+        if dbf.exists():
+            gdir, db_file = gd, dbf
             break
 
     if not db_file:
         print("{}")
         return
 
-    pruned_count = 0
-    saved_bytes = 0
     try:
         conn = sqlite3.connect(str(db_file), timeout=2.0)
         cur = conn.cursor()
+
+        # 1. Rewind any trailing broken error cascade
+        last_valid = find_last_valid_step_idx(cur)
+        cur_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
+        if cur_max > last_valid:
+            cur.execute("DELETE FROM steps WHERE idx > ?", (last_valid,))
+            # Sync summary DB
+            summ_db = gdir / "conversation_summaries.db"
+            if summ_db.exists():
+                s_conn = sqlite3.connect(str(summ_db), timeout=2.0)
+                s_conn.execute("UPDATE conversation_summaries SET step_count = ? WHERE conversation_id = ?",
+                               (last_valid + 1, convo_id))
+                s_conn.commit()
+                s_conn.close()
+
+        # 2. Prune historical tool output bloat
         r_ckp = cur.execute("SELECT MAX(idx) FROM steps WHERE step_type = 23").fetchone()
         last_ckp = r_ckp[0] if (r_ckp and r_ckp[0] is not None) else 0
 
         rows = cur.execute(
-            "SELECT idx, step_payload FROM steps WHERE idx > ? AND step_type = 132 AND length(step_payload) > 2000",
-            (last_ckp,)
+            "SELECT idx, step_payload FROM steps WHERE idx > ? AND idx <= ? AND step_type = 132 AND length(step_payload) > 2000",
+            (last_ckp, last_valid)
         ).fetchall()
 
-        # Only trigger if total bloated steps >= 5 or total bloat > 150KB
         total_len = sum(len(r[1]) for r in rows if r[1])
         if total_len > 150 * 1024 or len(rows) >= 8:
             for idx, payload in rows:
@@ -169,27 +199,14 @@ def main():
                 optimized = prune_tool_payload(payload, max_output_chars=500)
                 if len(optimized) < orig_len:
                     cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (optimized, idx))
-                    pruned_count += 1
-                    saved_bytes += (orig_len - len(optimized))
 
-            if pruned_count > 0:
-                conn.commit()
-
+        conn.commit()
         conn.close()
     except Exception:
         pass
 
-    if pruned_count > 0:
-        res = {
-            "injectSteps": [
-                {
-                    "ephemeralMessage": f"[agydoc-plugin] Auto-pruned {pruned_count} historical tool dumps (-{saved_bytes/1024:.0f} KB) to keep prefill fast."
-                }
-            ]
-        }
-        print(json.dumps(res))
-    else:
-        print("{}")
+    # Always return empty JSON object to avoid injecting dummy ephemeral steps
+    print("{}")
 
 
 if __name__ == "__main__":

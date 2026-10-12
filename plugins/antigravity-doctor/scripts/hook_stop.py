@@ -1,14 +1,29 @@
 """
 Antigravity Stop Hook for agydoc.
 Automatically handles connection interruptions or crash states upon turn termination.
-Clears hanging error steps and resets session status back to IDLE so the user is never
-trapped in a 10-minute retry deadlock.
+Rewinds trailing aborted thoughts and error cascades back to the last valid completed step
+and resets session status to IDLE so the session is never trapped in a retry/thought echo chamber.
 """
 
 import sys
 import json
 import sqlite3
 from pathlib import Path
+
+
+def find_last_valid_step_idx(cur) -> int:
+    rows = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 100").fetchall()
+    if not rows:
+        return 0
+    has_error = any(stype == 17 for idx, stype in rows[:30])
+    if not has_error:
+        return rows[0][0]
+    for idx, stype in rows:
+        if stype in (17, 90, 15):
+            continue
+        else:
+            return idx
+    return rows[-1][0]
 
 
 def main():
@@ -41,19 +56,18 @@ def main():
         if db_file.exists():
             summ_db = gdir / "conversation_summaries.db"
             try:
-                # 1. Rollback trailing error steps
                 conn = sqlite3.connect(str(db_file), timeout=2.0)
                 cur = conn.cursor()
-                while True:
-                    last = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 1").fetchone()
-                    if not last or last[1] != 17:
-                        break
-                    cur.execute("DELETE FROM steps WHERE idx = ?", (last[0],))
-                new_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
-                conn.commit()
+                
+                # Rewind trailing cascade
+                last_valid = find_last_valid_step_idx(cur)
+                cur_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
+                if cur_max > last_valid:
+                    cur.execute("DELETE FROM steps WHERE idx > ?", (last_valid,))
+                    conn.commit()
                 conn.close()
 
-                # 2. Reset summary status to IDLE
+                # Reset summary status to IDLE
                 if summ_db.exists():
                     s_conn = sqlite3.connect(str(summ_db), timeout=2.0)
                     s_conn.execute("""
@@ -62,7 +76,7 @@ def main():
                             not_fully_idle = 0, 
                             step_count = ? 
                         WHERE conversation_id = ?
-                    """, (new_max + 1, convo_id))
+                    """, (last_valid + 1, convo_id))
                     s_conn.commit()
                     s_conn.close()
             except Exception:
