@@ -80,7 +80,6 @@ def scan_sessions() -> List[Dict]:
                     
                 tail_rows = c_conn.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 10").fetchall()
                 if tail_rows:
-                    # Active error exists only if the tail itself ends in an error step or trailing cascade
                     if tail_rows[0][1] == 17:
                         has_active_error = True
                     elif tail_rows[0][1] == 15 and any(r[1] == 17 for r in tail_rows[:5]):
@@ -138,10 +137,8 @@ def find_last_valid_step_idx(cur) -> int:
 
     has_error_in_tail = any(stype == 17 for idx, stype in rows[:30])
     if not has_error_in_tail:
-        # Tail doesn't have an error, return current max
         return rows[0][0]
 
-    # Walk backwards past broken cascade steps until hitting a valid completed step
     for idx, stype in rows:
         if stype in (17, 90, 15):
             continue
@@ -156,10 +153,11 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
     Safely heals a bloated or bricked session:
     1. Creates timestamped safety backups of conversation DB and summaries DB.
     2. Rewinds trailing aborted error cascades back to the last valid completed step.
-    3. Cleans orphaned error steps (17) and plugin notification noise (90) to eliminate echo loops.
-    4. Prunes bloated tool outputs since the last checkpoint.
-    5. Resets conversation summary status to IDLE.
-    6. Validates integrity and vacuums the database.
+    3. Cleans aborted thoughts (15 immediately preceding 17) and orphaned errors (17).
+    4. Cleans legacy plugin ephemeral noise steps (90).
+    5. Prunes bloated tool outputs since the last checkpoint.
+    6. Resets conversation summary status to IDLE.
+    7. Validates integrity and vacuums the database.
     """
     conv_db = Path(session_info["db_path"])
     summ_db = Path(session_info["summ_db_path"])
@@ -186,12 +184,27 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
         if not dry_run:
             cur.execute("DELETE FROM steps WHERE idx > ?", (last_valid_idx,))
             
-    # 2. Clean dead error steps (17) and ephemeral message noise (90 with agydoc-plugin)
+    # 2. Clean aborted thoughts directly preceding errors, dead error steps (17), and plugin noise (90)
+    cleaned_aborted_thoughts = 0
     cleaned_error_steps = 0
     cleaned_noise_steps = 0
     if not dry_run:
+        # Delete aborted thoughts that were followed by errors
+        cur.execute("""
+            DELETE FROM steps 
+            WHERE step_type = 15 AND idx IN (
+                SELECT s1.idx FROM steps s1 
+                JOIN steps s2 ON s2.idx = s1.idx + 1 
+                WHERE s1.step_type = 15 AND s2.step_type = 17
+            )
+        """)
+        cleaned_aborted_thoughts = cur.rowcount
+
+        # Delete all error steps
         cur.execute("DELETE FROM steps WHERE step_type = 17")
         cleaned_error_steps = cur.rowcount
+
+        # Delete agydoc plugin notification noise
         cur.execute("DELETE FROM steps WHERE step_type = 90 AND step_payload LIKE ?", (b"%agydoc-plugin%",))
         cleaned_noise_steps = cur.rowcount
 
@@ -237,11 +250,12 @@ def heal_session(session_info: Dict, dry_run: bool = False) -> Dict:
         s_conn.commit()
         s_conn.close()
         
+    total_cleaned = deleted_cascade_steps + cleaned_error_steps + cleaned_aborted_thoughts + cleaned_noise_steps
     return {
         "id": session_info["id"],
         "title": session_info["title"],
         "backup_path": str(conv_bak) if not dry_run else "dry-run",
-        "deleted_error_steps": deleted_cascade_steps + cleaned_error_steps,
+        "deleted_error_steps": total_cleaned,
         "cleaned_noise_steps": cleaned_noise_steps,
         "pruned_steps": pruned_steps_count,
         "saved_kb": saved_bytes / 1024,
