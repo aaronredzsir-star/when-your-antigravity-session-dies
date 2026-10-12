@@ -1,10 +1,10 @@
 # 🩺 Antigravity Doctor (`agydoc`)
 
-> Quick, zero-dependency CLI to rescue bricked Google Antigravity sessions and fix the 10-minute retry loop.
+> Automatic context hygiene, payload pruning, and crash recovery for Google Antigravity. Zero dependencies.
 
 ## Why?
 
-Long sessions accumulate heavy tool outputs in local SQLite, triggering gateway timeouts and endless retry loops. `agydoc` safely prunes bloated historical tool outputs—unlocking the session while keeping 100% of your prompts, thoughts, and diffs intact.
+Long sessions accumulate heavy tool outputs (`view_file`, terminal dumps) in local SQLite, causing prefill delays, gateway timeouts (`stream interrupted / EOF`), and 10-minute retry deadlocks. `agydoc` safely prunes bloated tool outputs—unlocking sessions while keeping 100% of user prompts, assistant reasoning, and code diffs intact.
 
 ---
 
@@ -17,11 +17,39 @@ git clone https://github.com/aaronredzsir-star/when-your-antigravity-session-die
 cd when-your-antigravity-session-dies
 ```
 
-*(Optional: run `pip install -e .` to use the global `agydoc` command)*
+---
+
+## 🤖 Automatic Modes (Set-and-Forget)
+
+### Option A: Install Native Antigravity Plugin (Recommended)
+
+Installs directly into `~/.gemini/config/plugins/antigravity-doctor`:
+
+```bash
+python agydoc.py install-plugin
+```
+
+* **PreInvocation Hook**: Runs before every model turn; auto-prunes historical tool bloat if it exceeds safe thresholds to prevent gateway timeouts.
+* **Stop Hook**: Automatically clears hanging error loops if a connection drops, keeping sessions in `IDLE` state.
+* *(To uninstall: `python agydoc.py uninstall-plugin`)*
+
+### Option B: Run Background Watcher Daemon
+
+Continuously monitors session databases and automatically rescues stuck sessions:
+
+```bash
+python agydoc.py watch
+```
+
+```text
+[*] Antigravity Doctor Watcher started (interval: 15s).
+[14:51:25] [!] Auto-healing session d01d9544 (MAP复现与知识图谱可视化)...
+           -> Rescued! Pruned 8 steps (-98.4 KB). State is now IDLE.
+```
 
 ---
 
-## 🛠️ Usage & Examples
+## 🛠️ Manual CLI Usage & Examples
 
 ### 1. Diagnose Sessions (`scan`)
 Find which conversations are deadlocked or bloated:
@@ -37,8 +65,8 @@ d01d9544...  IDLE     32.2 MB  882    [?] BLOATED
 b06a3eb7...  IDLE     1.2 MB   45     [✓] HEALTHY
 ```
 
-### 2. Heal Bricked Sessions (`heal`)
-Prunes oversized tool outputs, removes trailing retry errors, and unlocks sessions back to `IDLE`:
+### 2. Heal Sessions Manually (`heal`)
+Prunes oversized tool outputs and recovers status back to `IDLE`:
 
 ```bash
 # Heal all stuck or bloated sessions
@@ -56,7 +84,7 @@ python agydoc.py heal dd8201a0
 ```
 
 ### 3. Rollback / Undo (`restore`)
-Every operation creates an automatic timestamped snapshot. Revert anytime:
+Every operation creates an automatic timestamped backup. Revert anytime:
 
 ```bash
 python agydoc.py restore dd8201a0

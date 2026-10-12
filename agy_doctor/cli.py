@@ -3,8 +3,12 @@ Command Line Interface for Antigravity Doctor.
 """
 
 import sys
+import shutil
 import argparse
+from pathlib import Path
+
 from .core import scan_sessions, heal_session, restore_session
+from .watcher import run_watch_loop
 from . import __version__
 
 BANNER = f"""
@@ -72,6 +76,7 @@ def cmd_scan(args):
     
     if bricked_count > 0 or warning_count > 0:
         print("\nTip: Run `agydoc heal --all` to automatically rescue stuck sessions and prune bloated history.")
+        print("     Or run `agydoc watch` / `agydoc install-plugin` for continuous auto-healing.")
 
 
 def cmd_heal(args):
@@ -118,6 +123,67 @@ def cmd_restore(args):
         print(f"[-] No backup files found for session ID {args.session_id}")
 
 
+def cmd_watch(args):
+    print(BANNER)
+    run_watch_loop(interval_sec=args.interval)
+
+
+def get_plugin_src_dir() -> Path:
+    # Try finding plugins/antigravity-doctor relative to package or repo root
+    current_file = Path(__file__).resolve()
+    candidates = [
+        current_file.parent.parent / "plugins" / "antigravity-doctor",
+        current_file.parent / "plugins" / "antigravity-doctor",
+        Path.cwd() / "plugins" / "antigravity-doctor"
+    ]
+    for c in candidates:
+        if c.exists() and (c / "plugin.json").exists():
+            return c
+    raise FileNotFoundError("Could not locate plugin source directory (plugins/antigravity-doctor).")
+
+
+def cmd_install_plugin(args):
+    print(BANNER)
+    try:
+        src = get_plugin_src_dir()
+    except FileNotFoundError as e:
+        print(f"[-] Error: {e}")
+        return
+
+    if args.workspace:
+        dest = Path.cwd() / ".agents" / "plugins" / "antigravity-doctor"
+        scope = "Workspace (.agents/plugins)"
+    else:
+        dest = Path.home() / ".gemini" / "config" / "plugins" / "antigravity-doctor"
+        scope = "Global (~/.gemini/config/plugins)"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+
+    shutil.copytree(src, dest)
+    print(f"[+] Successfully installed Antigravity Doctor plugin to:")
+    print(f"    {dest}")
+    print(f"\n[*] Scope: {scope}")
+    print(f"[*] The plugin is now active! It will automatically:")
+    print(f"    1. Prune bloated tool output before prefill (preventing gateway EOFs).")
+    print(f"    2. Clear hanging error loops on disconnect so sessions never brick.")
+
+
+def cmd_uninstall_plugin(args):
+    print(BANNER)
+    if args.workspace:
+        dest = Path.cwd() / ".agents" / "plugins" / "antigravity-doctor"
+    else:
+        dest = Path.home() / ".gemini" / "config" / "plugins" / "antigravity-doctor"
+
+    if dest.exists():
+        shutil.rmtree(dest)
+        print(f"[+] Successfully removed plugin from {dest}")
+    else:
+        print(f"[-] Plugin not found at {dest}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Antigravity Doctor: Context hygiene & crash recovery toolkit for Google Antigravity",
@@ -126,7 +192,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
     
     # scan
-    p_scan = subparsers.add_parser("scan", help="Scan and diagnose all Antigravity sessions")
+    subparsers.add_parser("scan", help="Scan and diagnose all Antigravity sessions")
     
     # heal
     p_heal = subparsers.add_parser("heal", help="Rescue stuck sessions and prune bloated tool history")
@@ -137,6 +203,18 @@ def main():
     # restore
     p_res = subparsers.add_parser("restore", help="Restore session from latest safety backup")
     p_res.add_argument("session_id", help="Session ID to restore")
+
+    # watch
+    p_watch = subparsers.add_parser("watch", help="Run background watcher to auto-heal stuck/bloated sessions")
+    p_watch.add_argument("--interval", type=int, default=15, help="Check interval in seconds (default: 15)")
+
+    # install-plugin
+    p_inst = subparsers.add_parser("install-plugin", help="Install the native Antigravity auto-healing plugin")
+    p_inst.add_argument("--workspace", action="store_true", help="Install to local workspace (.agents) instead of global (~/.gemini)")
+
+    # uninstall-plugin
+    p_uninst = subparsers.add_parser("uninstall-plugin", help="Uninstall the native Antigravity auto-healing plugin")
+    p_uninst.add_argument("--workspace", action="store_true", help="Uninstall from workspace instead of global")
     
     args = parser.parse_args()
     
@@ -146,8 +224,13 @@ def main():
         cmd_heal(args)
     elif args.command == "restore":
         cmd_restore(args)
+    elif args.command == "watch":
+        cmd_watch(args)
+    elif args.command == "install-plugin":
+        cmd_install_plugin(args)
+    elif args.command == "uninstall-plugin":
+        cmd_uninstall_plugin(args)
     else:
-        # Default behavior: scan
         cmd_scan(args)
 
 

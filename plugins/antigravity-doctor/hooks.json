@@ -1,0 +1,18 @@
+{
+  "agydoc-auto-healer": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python ./scripts/hook_pre_invocation.py",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python ./scripts/hook_stop.py",
+        "timeout": 10
+      }
+    ]
+  }
+}
