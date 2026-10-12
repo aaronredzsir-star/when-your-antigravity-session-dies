@@ -66,10 +66,10 @@ b06a3eb7...  IDLE     1.2 MB   45     [✓] HEALTHY
 ```
 
 ### 2. Heal Sessions Manually (`heal`)
-Prunes oversized tool outputs and recovers status back to `IDLE`:
+Cleans hanging retry loops and auto-compacts bloated context:
 
 ```bash
-# Heal all stuck or bloated sessions
+# Heal all stuck or warning sessions
 python agydoc.py heal --all
 
 # Or heal a specific session
@@ -77,13 +77,29 @@ python agydoc.py heal dd8201a0
 ```
 ```text
 [+] Healing dd8201a0...
-    - Cleared hanging errors : 1
-    - Pruned tool outputs    : 38 steps (-728.5 KB)
-    - Safety backup saved    : dd8201a0.db.bak_20261012_1145
-    -> Recovered to IDLE state!
+    - Removed hanging errors : 2
+    - Post-checkpoint size   : 485.2 KB
+    - Auto-compacted         : Yes (Checkpoint synthesized)
+    - Database integrity     : ok
+    - Safety backup saved to : dd8201a0.db.bak_20261013_0410
+    -> Session successfully recovered to IDLE state!
 ```
 
-### 3. Rollback / Undo (`restore`)
+### 3. Native Compaction (`compact`)
+Antigravity lacks a manual `/compact` command. When tool chains accumulate massive unpruned context, subsequent model calls can time out at the 60s gateway limit. `agydoc compact` synthesizes a native Checkpoint (`step_type = 23`), resetting active LLM prefill context to ~15 KB while leaving 100% of past SQLite steps intact:
+
+```bash
+python agydoc.py compact d01d9544
+```
+```text
+[*] Synthesizing native checkpoint for d01d9544...
+[+] Successfully synthesized native Checkpoint at Step 3311!
+    - Checkpoint payload size: 79816 bytes
+    - Database integrity     : ok
+    -> LLM active prefill context reset to ~15 KB. Zero gateway timeout risk!
+```
+
+### 4. Rollback / Undo (`restore`)
 Every operation creates an automatic timestamped backup. Revert anytime:
 
 ```bash

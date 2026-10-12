@@ -7,7 +7,7 @@ import shutil
 import argparse
 from pathlib import Path
 
-from .core import scan_sessions, heal_session, restore_session
+from .core import scan_sessions, heal_session, restore_session, compact_session
 from .watcher import run_watch_loop
 from . import __version__
 
@@ -20,7 +20,7 @@ BANNER = f"""
 \\_| |_/_| |_|\\__|_|\\__, |_|  \\__,_| \\_/ |_|\\__|\\__, | |____/ \\___/ \\___|\\__\\___/|_|   
                     __/ |                        __/ |                                
                    |___/                        |___/   v{__version__}
-Context hygiene, payload pruning, and crash recovery toolkit for Google Antigravity.
+Context hygiene, native compaction, and crash recovery toolkit for Google Antigravity.
 """
 
 def print_table(headers, rows):
@@ -46,7 +46,7 @@ def cmd_scan(args):
         print("[-] No Antigravity conversation sessions found.")
         return
 
-    headers = ["ID (Short)", "Status", "Size", "Steps", "Health", "Title / Note"]
+    headers = ["ID (Short)", "Status", "Size", "Steps", "Post-Ckp", "Health", "Title / Note"]
     table_rows = []
     
     bricked_count = 0
@@ -57,8 +57,9 @@ def cmd_scan(args):
         status = "RUNNING" if s["status"] == "CASCADE_RUN_STATUS_RUNNING" else "IDLE"
         size = f"{s['size_mb']:.1f} MB"
         steps = str(s["total_steps"])
+        post_ckp = f"{s['post_ckp_bytes'] / 1024:.1f} KB"
         health = s["health"]
-        title = s["title"][:30]
+        title = s["title"][:26]
         
         if health == "BRICKED":
             bricked_count += 1
@@ -69,14 +70,14 @@ def cmd_scan(args):
         else:
             health = "[+] OK"
             
-        table_rows.append([sid, status, size, steps, health, title])
+        table_rows.append([sid, status, size, steps, post_ckp, health, title])
         
     print_table(headers, table_rows)
     print(f"\nTotal: {len(sessions)} sessions | Bricked: {bricked_count} | Warning: {warning_count}")
     
     if bricked_count > 0 or warning_count > 0:
-        print("\nTip: Run `agydoc heal --all` to automatically rescue stuck sessions and prune bloated history.")
-        print("     Or run `agydoc watch` / `agydoc install-plugin` for continuous auto-healing.")
+        print("\nTip: Run `agydoc heal --all` to automatically rescue stuck sessions and auto-compact context.")
+        print("     Or run `agydoc compact <session_id>` to synthesize a native checkpoint and drop prefill latency.")
 
 
 def cmd_heal(args):
@@ -102,15 +103,37 @@ def cmd_heal(args):
         
     for s in target_sessions:
         print(f"\n[+] Healing {s['id']}...")
-        res = heal_session(s, dry_run=args.dry_run)
+        res = heal_session(s, dry_run=args.dry_run, auto_compact=not args.no_compact)
         print(f"    - Removed hanging errors : {res['deleted_error_steps']}")
-        print(f"    - Pruned bloated steps   : {res['pruned_steps']}")
-        print(f"    - Reclaimed payload size : {res['saved_kb']:.1f} KB")
+        print(f"    - Post-checkpoint size   : {res['post_ckp_kb']:.1f} KB")
+        print(f"    - Auto-compacted         : {'Yes (Checkpoint synthesized)' if res['compacted'] else 'No'}")
         print(f"    - Database integrity     : {res['integrity']}")
         print(f"    - Safety backup saved to : {res['backup_path']}")
         print(f"    -> Session successfully recovered to IDLE state!")
         
-    print("\n[V] All targeted sessions healed! You can now restart Antigravity and continue work.")
+    print("\n[V] All targeted sessions healed! You can now resume your conversations safely.")
+
+
+def cmd_compact(args):
+    print(BANNER)
+    sessions = scan_sessions()
+    target = [s for s in sessions if s["id"].startswith(args.session_id)]
+    if not target:
+        print(f"[-] Session not found for ID or prefix: {args.session_id}")
+        return
+    session_info = target[0]
+    print(f"[*] Synthesizing native checkpoint for {session_info['id']} ({session_info['title']})...")
+    print(f"    - Current steps: {session_info['total_steps']} | Post-checkpoint payload: {session_info['post_ckp_bytes'] / 1024:.1f} KB")
+    res = compact_session(session_info, summary_notes=args.notes, dry_run=args.dry_run)
+    if res.get("status") == "ALREADY_COMPACTED":
+        print("[+] Session is already fully compacted at current tip!")
+        return
+    print(f"[+] Successfully synthesized native Checkpoint at Step {res['checkpoint_idx']}!")
+    print(f"    - Cleaned retries        : {res['cleaned_retries']}")
+    print(f"    - Checkpoint payload size: {res['payload_size']} bytes")
+    print(f"    - Database integrity     : {res['integrity']}")
+    print(f"    - Safety backup saved to : {res['backup_path']}")
+    print("    -> LLM active prefill context reset to ~15 KB. Zero gateway timeout risk!")
 
 
 def cmd_restore(args):
@@ -129,7 +152,6 @@ def cmd_watch(args):
 
 
 def get_plugin_src_dir() -> Path:
-    # Try finding plugins/antigravity-doctor relative to package or repo root
     current_file = Path(__file__).resolve()
     candidates = [
         current_file.parent.parent / "plugins" / "antigravity-doctor",
@@ -166,7 +188,7 @@ def cmd_install_plugin(args):
     print(f"    {dest}")
     print(f"\n[*] Scope: {scope}")
     print(f"[*] The plugin is now active! It will automatically:")
-    print(f"    1. Prune bloated tool output before prefill (preventing gateway EOFs).")
+    print(f"    1. Monitor post-checkpoint context bloat.")
     print(f"    2. Clear hanging error loops on disconnect so sessions never brick.")
 
 
@@ -195,11 +217,18 @@ def main():
     subparsers.add_parser("scan", help="Scan and diagnose all Antigravity sessions")
     
     # heal
-    p_heal = subparsers.add_parser("heal", help="Rescue stuck sessions and prune bloated tool history")
+    p_heal = subparsers.add_parser("heal", help="Rescue stuck sessions and auto-compact bloated context")
     p_heal.add_argument("session_id", nargs="?", help="Specific session ID or prefix to heal")
     p_heal.add_argument("--all", action="store_true", help="Heal all bricked and warning sessions")
+    p_heal.add_argument("--no-compact", action="store_true", help="Skip automatic checkpoint synthesis")
     p_heal.add_argument("--dry-run", action="store_true", help="Inspect without modifying files")
     
+    # compact
+    p_compact = subparsers.add_parser("compact", help="Synthesize native checkpoint to reset prefill latency")
+    p_compact.add_argument("session_id", help="Session ID or prefix to compact")
+    p_compact.add_argument("--notes", help="Optional summary notes to include in the checkpoint")
+    p_compact.add_argument("--dry-run", action="store_true", help="Inspect without modifying files")
+
     # restore
     p_res = subparsers.add_parser("restore", help="Restore session from latest safety backup")
     p_res.add_argument("session_id", help="Session ID to restore")
@@ -222,6 +251,8 @@ def main():
         cmd_scan(args)
     elif args.command == "heal":
         cmd_heal(args)
+    elif args.command == "compact":
+        cmd_compact(args)
     elif args.command == "restore":
         cmd_restore(args)
     elif args.command == "watch":
