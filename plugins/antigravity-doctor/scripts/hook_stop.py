@@ -1,29 +1,15 @@
 """
 Antigravity Stop Hook for agydoc.
-Automatically handles connection interruptions or crash states upon turn termination.
-Rewinds trailing aborted thoughts and error cascades back to the last valid completed step
-and resets session status to IDLE so the session is never trapped in a retry/thought echo chamber.
+Safe guardian:
+- NEVER deletes user messages, assistant reasoning, or history.
+- Only rolls back the single trailing interrupted error step (step_type == 17) if the session ended with an error.
+- Resets status back to IDLE so the session never locks in RUNNING.
 """
 
 import sys
 import json
 import sqlite3
 from pathlib import Path
-
-
-def find_last_valid_step_idx(cur) -> int:
-    rows = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 100").fetchall()
-    if not rows:
-        return 0
-    has_error = any(stype == 17 for idx, stype in rows[:30])
-    if not has_error:
-        return rows[0][0]
-    for idx, stype in rows:
-        if stype in (17, 90, 15):
-            continue
-        else:
-            return idx
-    return rows[-1][0]
 
 
 def main():
@@ -41,42 +27,37 @@ def main():
     term_reason = data.get("terminationReason", "")
     error_msg = data.get("error", "")
 
-    # Only act if an error occurred or the loop stopped due to an error
     if not convo_id or (term_reason != "error" and not error_msg):
         print("{}")
         return
 
     home = Path.home()
-    candidates = [
-        (home / ".gemini" / "antigravity", home / ".gemini" / "antigravity" / "conversations" / f"{convo_id}.db"),
-        (home / ".gemini" / "antigravity-ide", home / ".gemini" / "antigravity-ide" / "conversations" / f"{convo_id}.db"),
-    ]
-
-    for gdir, db_file in candidates:
+    for gdir in [home / ".gemini" / "antigravity", home / ".gemini" / "antigravity-ide"]:
+        db_file = gdir / "conversations" / f"{convo_id}.db"
+        summ_db = gdir / "conversation_summaries.db"
         if db_file.exists():
-            summ_db = gdir / "conversation_summaries.db"
             try:
-                conn = sqlite3.connect(str(db_file), timeout=2.0)
+                conn = sqlite3.connect(str(db_file), timeout=1.5)
                 cur = conn.cursor()
-                
-                # Rewind trailing cascade
-                last_valid = find_last_valid_step_idx(cur)
-                cur_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
-                if cur_max > last_valid:
-                    cur.execute("DELETE FROM steps WHERE idx > ?", (last_valid,))
-                    conn.commit()
+                # Only remove trailing step 17 if at the very tip
+                while True:
+                    last = cur.execute("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 1").fetchone()
+                    if not last or last[1] != 17:
+                        break
+                    cur.execute("DELETE FROM steps WHERE idx = ?", (last[0],))
+                new_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
+                conn.commit()
                 conn.close()
 
-                # Reset summary status to IDLE
                 if summ_db.exists():
-                    s_conn = sqlite3.connect(str(summ_db), timeout=2.0)
+                    s_conn = sqlite3.connect(str(summ_db), timeout=1.5)
                     s_conn.execute("""
                         UPDATE conversation_summaries 
                         SET status = 'CASCADE_RUN_STATUS_IDLE', 
                             not_fully_idle = 0, 
                             step_count = ? 
                         WHERE conversation_id = ?
-                    """, (last_valid + 1, convo_id))
+                    """, (new_max + 1, convo_id))
                     s_conn.commit()
                     s_conn.close()
             except Exception:
