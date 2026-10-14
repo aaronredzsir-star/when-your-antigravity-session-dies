@@ -13,10 +13,10 @@ import json
 import sqlite3
 from pathlib import Path
 
-# Add repo to sys.path for core imports
-repo_dir = Path(__file__).resolve().parent.parent.parent.parent
-if str(repo_dir) not in sys.path:
-    sys.path.insert(0, str(repo_dir))
+# Add plugin directory to sys.path so agy_doctor is self-contained
+plugin_dir = Path(__file__).resolve().parent.parent
+if str(plugin_dir) not in sys.path:
+    sys.path.insert(0, str(plugin_dir))
 
 
 def main():
