@@ -180,6 +180,96 @@ def _extract_recent_activity_notes(cur: sqlite3.Cursor, start_idx: int, end_idx:
     return "\n".join(notes)
 
 
+def _update_metadata_step_idx(meta_bytes: bytes, new_idx: int, conv_id: str = "") -> bytes:
+    if not meta_bytes:
+        return b""
+    outer = decode_fields(meta_bytes)
+    new_outer = []
+    for fn, wt, val in outer:
+        if fn == 20:
+            sub = decode_fields(val)
+            new_sub = []
+            for sfn, swt, sval in sub:
+                if sfn == 2:
+                    new_sub.append((2, 0, new_idx))
+                elif sfn == 4 and conv_id:
+                    new_sub.append((4, 2, conv_id.encode('utf-8')))
+                else:
+                    new_sub.append((sfn, swt, sval))
+            re_f20 = b''.join(encode_field(f, w, v) for f, w, v in new_sub)
+            new_outer.append((20, 2, re_f20))
+        else:
+            new_outer.append((fn, wt, val))
+    return b''.join(encode_field(f, w, v) for f, w, v in new_outer)
+
+
+def _insert_step_with_schema(cur, idx: int, step_type: int, payload: bytes, metadata: bytes = b""):
+    cols = [col[1] for col in cur.execute("PRAGMA table_info(steps)").fetchall()]
+    col_dict = {
+        "idx": idx,
+        "step_type": step_type,
+        "step_payload": payload,
+    }
+    if "status" in cols:
+        col_dict["status"] = 3
+    if "has_subtrajectory" in cols:
+        col_dict["has_subtrajectory"] = 0
+    if "step_format" in cols:
+        col_dict["step_format"] = 0
+    if "metadata" in cols and metadata:
+        col_dict["metadata"] = metadata
+
+    target_cols = [c for c in cols if c in col_dict]
+    placeholders = ", ".join(["?"] * len(target_cols))
+    sql = f"INSERT INTO steps ({', '.join(target_cols)}) VALUES ({placeholders})"
+    cur.execute(sql, [col_dict[c] for c in target_cols])
+
+
+def _clean_summary_db(summ_db_path, session_id: str, step_count: int, last_user_idx: Optional[int] = None):
+    p = Path(summ_db_path)
+    if not p.exists():
+        return
+    s_conn = sqlite3.connect(p)
+    cols = [col[1] for col in s_conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()]
+    
+    cleaned_raw = None
+    if "raw_summary" in cols:
+        row = s_conn.execute("SELECT raw_summary FROM conversation_summaries WHERE conversation_id = ?", (session_id,)).fetchone()
+        if row and row[0]:
+            fields = decode_fields(row[0])
+            new_fields = []
+            for fn, wt, val in fields:
+                if fn == 2:
+                    new_fields.append((fn, wt, step_count))
+                elif fn == 16 and last_user_idx is not None:
+                    new_fields.append((fn, wt, last_user_idx))
+                elif fn in [21, 26]:
+                    # Drop not_fully_idle and active flags
+                    continue
+                else:
+                    new_fields.append((fn, wt, val))
+            cleaned_raw = b''.join(encode_field(fn, wt, val) for fn, wt, val in new_fields)
+
+    updates = ["status = 'CASCADE_RUN_STATUS_IDLE'"]
+    params = []
+    if "not_fully_idle" in cols:
+        updates.append("not_fully_idle = 0")
+    if "step_count" in cols:
+        updates.append("step_count = ?")
+        params.append(step_count)
+    if "last_user_input_step_index" in cols and last_user_idx is not None:
+        updates.append("last_user_input_step_index = ?")
+        params.append(last_user_idx)
+    if "raw_summary" in cols and cleaned_raw is not None:
+        updates.append("raw_summary = ?")
+        params.append(cleaned_raw)
+
+    params.append(session_id)
+    s_conn.execute(f"UPDATE conversation_summaries SET {', '.join(updates)} WHERE conversation_id = ?", params)
+    s_conn.commit()
+    s_conn.close()
+
+
 def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry_run: bool = False, preserve_trailing_prompt: bool = True) -> Dict:
     """
     Synthesizes a native Antigravity Checkpoint (step_type = 23).
@@ -306,9 +396,13 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
         if fnum == 5:
             new_inner_fields.append((5, 2, new_summary.encode('utf-8')))
             has_f5 = True
+        elif fnum == 11:
+            new_inner_fields.append((11, 0, last_ckp_idx))
         elif fnum == 12:
             new_inner_fields.append((12, 0, target_idx))
             has_f12 = True
+        elif fnum == 25:
+            new_inner_fields.append((25, 0, target_idx - 1))
         else:
             new_inner_fields.append((fnum, wtype, val))
             
@@ -319,35 +413,30 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
         
     new_inner_bytes = b''.join(encode_field(fn, wt, v) for fn, wt, v in new_inner_fields)
 
-    # 7. Build outer checkpoint payload
+    # 7. Build outer checkpoint payload and metadata
+    f5_meta = _update_metadata_step_idx(f5_bytes, target_idx, session_info["id"]) if f5_bytes else b""
     f1 = encode_field(1, 0, 23)
     f4 = encode_field(4, 0, 3) # CASCADE_STEP_STATUS_DONE
-    f5 = encode_field(5, 2, f5_bytes) if f5_bytes else b''
+    f5 = encode_field(5, 2, f5_meta) if f5_meta else b''
     f30 = encode_field(30, 2, new_inner_bytes)
     checkpoint_payload = f1 + f4 + f5 + f30
 
     # 8. Insert checkpoint and update summaries DB
     final_step_count = target_idx + 1
+    last_user_idx = None
     if not dry_run:
-        cur.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, 23, ?)", (target_idx, checkpoint_payload))
+        _insert_step_with_schema(cur, target_idx, 23, checkpoint_payload, metadata=f5_meta)
         if trailing_user_prompt:
-            cur.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)", (target_idx + 1, trailing_user_prompt[0], trailing_user_prompt[1]))
+            prompt_idx = target_idx + 1
+            last_user_idx = prompt_idx
+            prompt_meta = _update_metadata_step_idx(trailing_user_prompt[1], prompt_idx, session_info["id"]) if len(trailing_user_prompt) > 2 else b""
+            _insert_step_with_schema(cur, prompt_idx, trailing_user_prompt[0], trailing_user_prompt[1], metadata=prompt_meta)
             final_step_count = target_idx + 2
         conn.commit()
         integrity = cur.execute("PRAGMA integrity_check").fetchone()[0]
         conn.close()
 
-        if summ_db.exists():
-            s_conn = sqlite3.connect(summ_db)
-            s_conn.execute("""
-                UPDATE conversation_summaries
-                SET status = 'CASCADE_RUN_STATUS_IDLE',
-                    not_fully_idle = 0,
-                    step_count = ?
-                WHERE conversation_id = ?
-            """, (final_step_count, session_info["id"]))
-            s_conn.commit()
-            s_conn.close()
+        _clean_summary_db(summ_db, session_info["id"], final_step_count, last_user_idx=last_user_idx)
     else:
         if trailing_user_prompt:
             cur.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)", (current_max + 1, trailing_user_prompt[0], trailing_user_prompt[1]))
@@ -366,6 +455,7 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
         "payload_size": len(checkpoint_payload),
         "integrity": integrity
     }
+
 
 
 def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool = True) -> Dict:
@@ -431,16 +521,7 @@ def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool =
     else:
         # Sync summary DB
         if not dry_run and summ_db.exists():
-            s_conn = sqlite3.connect(summ_db)
-            s_conn.execute("""
-                UPDATE conversation_summaries 
-                SET status = 'CASCADE_RUN_STATUS_IDLE', 
-                    not_fully_idle = 0, 
-                    step_count = ? 
-                WHERE conversation_id = ?
-            """, (new_max + 1, session_info["id"]))
-            s_conn.commit()
-            s_conn.close()
+            _clean_summary_db(summ_db, session_info["id"], new_max + 1)
 
     conn = sqlite3.connect(conv_db)
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
