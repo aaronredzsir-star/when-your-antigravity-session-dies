@@ -180,7 +180,7 @@ def _extract_recent_activity_notes(cur: sqlite3.Cursor, start_idx: int, end_idx:
     return "\n".join(notes)
 
 
-def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry_run: bool = False) -> Dict:
+def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry_run: bool = False, preserve_trailing_prompt: bool = True) -> Dict:
     """
     Synthesizes a native Antigravity Checkpoint (step_type = 23).
     This non-destructively reduces LLM active prefill weight from ~500 KB to ~15 KB,
@@ -218,15 +218,24 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
                 break
         conn.commit()
 
-    # 2. Find last native checkpoint
+    # 2. Check if the very tip is an unreplied user prompt that should be preserved active
+    trailing_user_prompt = None
+    if preserve_trailing_prompt and not dry_run:
+        last_step = cur.execute("SELECT idx, step_type, step_payload FROM steps ORDER BY idx DESC LIMIT 1").fetchone()
+        if last_step and last_step[1] in (14, 101):
+            trailing_user_prompt = (last_step[1], last_step[2])
+            cur.execute("DELETE FROM steps WHERE idx = ?", (last_step[0],))
+            conn.commit()
+
+    # 3. Find last native checkpoint
     last_ckp_row = cur.execute("SELECT idx, step_payload FROM steps WHERE step_type = 23 ORDER BY idx DESC LIMIT 1").fetchone()
     last_ckp_idx = last_ckp_row[0] if last_ckp_row else 0
     
-    # 3. Find current max step idx
+    # 4. Find current max step idx
     current_max = cur.execute("SELECT MAX(idx) FROM steps").fetchone()[0] or 0
     target_idx = current_max + 1
     
-    if current_max == last_ckp_idx and last_ckp_row:
+    if current_max == last_ckp_idx and last_ckp_row and not trailing_user_prompt:
         # Already compacted at tip
         conn.close()
         return {
@@ -318,8 +327,12 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
     checkpoint_payload = f1 + f4 + f5 + f30
 
     # 8. Insert checkpoint and update summaries DB
+    final_step_count = target_idx + 1
     if not dry_run:
         cur.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, 23, ?)", (target_idx, checkpoint_payload))
+        if trailing_user_prompt:
+            cur.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)", (target_idx + 1, trailing_user_prompt[0], trailing_user_prompt[1]))
+            final_step_count = target_idx + 2
         conn.commit()
         integrity = cur.execute("PRAGMA integrity_check").fetchone()[0]
         conn.close()
@@ -332,10 +345,12 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
                     not_fully_idle = 0,
                     step_count = ?
                 WHERE conversation_id = ?
-            """, (target_idx + 1, session_info["id"]))
+            """, (final_step_count, session_info["id"]))
             s_conn.commit()
             s_conn.close()
     else:
+        if trailing_user_prompt:
+            cur.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)", (current_max + 1, trailing_user_prompt[0], trailing_user_prompt[1]))
         conn.close()
         integrity = "ok (dry-run)"
 
@@ -344,8 +359,10 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
         "title": session_info["title"],
         "backup_path": str(conv_bak) if not dry_run else "dry-run",
         "checkpoint_idx": target_idx,
+        "final_step_idx": target_idx + (1 if trailing_user_prompt else 0),
         "previous_checkpoint_idx": last_ckp_idx,
         "cleaned_retries": cleaned_retries,
+        "preserved_prompt": bool(trailing_user_prompt),
         "payload_size": len(checkpoint_payload),
         "integrity": integrity
     }
@@ -408,9 +425,9 @@ def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool =
     compact_info = None
     if auto_compact and post_ckp_bytes > 150 * 1024 and not dry_run:
         # Automatically compact to prevent recurring gateway timeouts
-        compact_info = compact_session(session_info, dry_run=dry_run)
+        compact_info = compact_session(session_info, dry_run=dry_run, preserve_trailing_prompt=True)
         compacted = True
-        new_max = compact_info["checkpoint_idx"]
+        new_max = compact_info["final_step_idx"]
     else:
         # Sync summary DB
         if not dry_run and summ_db.exists():
