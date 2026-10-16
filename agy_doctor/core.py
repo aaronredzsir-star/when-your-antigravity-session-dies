@@ -270,7 +270,7 @@ def _clean_summary_db(summ_db_path, session_id: str, step_count: int, last_user_
     s_conn.close()
 
 
-def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry_run: bool = False, preserve_trailing_prompt: bool = True) -> Dict:
+def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry_run: bool = False, preserve_trailing_prompt: bool = True, create_backup: bool = False) -> Dict:
     """
     Synthesizes a native Antigravity Checkpoint (step_type = 23).
     This non-destructively reduces LLM active prefill weight from ~500 KB to ~15 KB,
@@ -279,11 +279,11 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
     conv_db = Path(session_info["db_path"])
     summ_db = Path(session_info["summ_db_path"])
     
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    conv_bak = conv_db.with_name(f"{conv_db.name}.bak_{timestamp}")
-    summ_bak = summ_db.with_name(f"{summ_db.name}.bak_{timestamp}")
+    # Use a single rotating backup file to prevent disk exhaustion
+    conv_bak = conv_db.with_name(f"{conv_db.name}.bak")
+    summ_bak = summ_db.with_name(f"{summ_db.name}.bak")
     
-    if not dry_run:
+    if not dry_run and create_backup:
         shutil.copy2(conv_db, conv_bak)
         if summ_db.exists():
             shutil.copy2(summ_db, summ_bak)
@@ -446,7 +446,7 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
     return {
         "id": session_info["id"],
         "title": session_info["title"],
-        "backup_path": str(conv_bak) if not dry_run else "dry-run",
+        "backup_path": str(conv_bak) if (not dry_run and create_backup) else "none",
         "checkpoint_idx": target_idx,
         "final_step_idx": target_idx + (1 if trailing_user_prompt else 0),
         "previous_checkpoint_idx": last_ckp_idx,
@@ -458,10 +458,10 @@ def compact_session(session_info: Dict, summary_notes: Optional[str] = None, dry
 
 
 
-def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool = True) -> Dict:
+def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool = True, create_backup: bool = True) -> Dict:
     """
     Safely heals a bloated or bricked session with ZERO destruction:
-    1. Creates timestamped safety backups of conversation DB and summaries DB.
+    1. Optionally creates a single rotating safety backup of conversation DB and summaries DB (.bak).
     2. Removes trailing retry loops (alternating 17 and 15) at the very tip.
     3. If post-checkpoint payload exceeds 150 KB, automatically synthesizes a native Checkpoint (step_type = 23).
     4. Resets conversation summary status to IDLE and syncs step_count.
@@ -470,11 +470,11 @@ def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool =
     conv_db = Path(session_info["db_path"])
     summ_db = Path(session_info["summ_db_path"])
     
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    conv_bak = conv_db.with_name(f"{conv_db.name}.bak_{timestamp}")
-    summ_bak = summ_db.with_name(f"{summ_db.name}.bak_{timestamp}")
+    # Use a single rotating backup file to prevent disk exhaustion
+    conv_bak = conv_db.with_name(f"{conv_db.name}.bak")
+    summ_bak = summ_db.with_name(f"{summ_db.name}.bak")
     
-    if not dry_run:
+    if not dry_run and create_backup:
         shutil.copy2(conv_db, conv_bak)
         if summ_db.exists():
             shutil.copy2(summ_db, summ_bak)
@@ -514,8 +514,8 @@ def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool =
     compacted = False
     compact_info = None
     if auto_compact and post_ckp_bytes > 150 * 1024 and not dry_run:
-        # Automatically compact to prevent recurring gateway timeouts
-        compact_info = compact_session(session_info, dry_run=dry_run, preserve_trailing_prompt=True)
+        # Automatically compact to prevent recurring gateway timeouts (no extra nested backup)
+        compact_info = compact_session(session_info, dry_run=dry_run, preserve_trailing_prompt=True, create_backup=False)
         compacted = True
         new_max = compact_info["final_step_idx"]
     else:
@@ -530,7 +530,7 @@ def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool =
     return {
         "id": session_info["id"],
         "title": session_info["title"],
-        "backup_path": str(conv_bak) if not dry_run else "dry-run",
+        "backup_path": str(conv_bak) if (not dry_run and create_backup) else "none",
         "deleted_error_steps": deleted_error_steps,
         "compacted": compacted,
         "post_ckp_kb": post_ckp_bytes / 1024,
@@ -540,12 +540,16 @@ def heal_session(session_info: Dict, dry_run: bool = False, auto_compact: bool =
 
 
 def restore_session(session_id: str) -> Optional[str]:
-    """Restores the latest backup for a given session ID."""
+    """Restores the backup for a given session ID."""
     for gdir in get_gemini_dirs():
         conv_dir = gdir / "conversations"
         if not conv_dir.exists():
             continue
         db_file = conv_dir / f"{session_id}.db"
+        bak = conv_dir / f"{session_id}.db.bak"
+        if bak.exists():
+            shutil.copy2(bak, db_file)
+            return str(bak)
         baks = sorted(conv_dir.glob(f"{session_id}.db.bak_*"), key=lambda p: p.stat().st_mtime, reverse=True)
         if baks:
             latest_bak = baks[0]

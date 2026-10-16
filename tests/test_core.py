@@ -127,6 +127,15 @@ class TestCompactionAndHealing(unittest.TestCase):
         conn.close()
         self.assertEqual(max_idx, 10)
 
+    def test_backup_rotation_prevents_bloat(self):
+        # Multiple heal calls with create_backup=True should only produce 1 .bak file, not timestamp proliferation
+        heal_session(self.session_info, auto_compact=False, create_backup=True)
+        heal_session(self.session_info, auto_compact=False, create_backup=True)
+        bak_files = list(Path(self.temp_dir.name).glob("*.bak*"))
+        # Only test_session.db.bak and conversation_summaries.db.bak should exist
+        self.assertEqual(len(bak_files), 2)
+        self.assertTrue((Path(self.temp_dir.name) / "test_session.db.bak").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

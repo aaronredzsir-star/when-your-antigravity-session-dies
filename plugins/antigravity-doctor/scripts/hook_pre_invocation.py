@@ -64,7 +64,7 @@ def main():
                             "db_path": str(db_file),
                             "summ_db_path": str(summ_db)
                         }
-                        compact_session(session_info, preserve_trailing_prompt=True)
+                        compact_session(session_info, preserve_trailing_prompt=True, create_backup=False)
                     except Exception:
                         pass
                 else:
