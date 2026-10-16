@@ -54,8 +54,8 @@ def main():
                 ).fetchone()[0] or 0
                 conn.close()
 
-                # 2. Proactive auto-compaction if context exceeds safety threshold (>200 KB)
-                if post_ckp_bytes > 200 * 1024:
+                # 2. Proactive auto-compaction only if context reaches severe bloat (>15 MB)
+                if post_ckp_bytes > 15 * 1024 * 1024:
                     try:
                         from agy_doctor.core import compact_session
                         session_info = {
